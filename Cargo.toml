@@ -1,0 +1,16 @@
+[package]
+name = "rtest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.155"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 'z'
+
+[build-dependencies]
+cc = "1.0"
