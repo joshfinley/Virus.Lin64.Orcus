@@ -22,6 +22,32 @@ const O_CLOEXEC: usize =   0x2000000;
 
 const STDOUT: usize = 1;
 
+const SYS_FSTAT: usize = 5;
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+
+#[repr(C)]
+struct linux_stat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime: i64,
+    st_atime_nsec: i64,
+    st_mtime: i64,
+    st_mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
+    __unused: [i64; 3],
+}
+
 #[repr(C)]
 struct linux_dirent64 {
     d_ino: u64,        // Inode number
@@ -33,63 +59,89 @@ struct linux_dirent64 {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    let dir = b".\0";  // Current directory
+    print_str(b"Opening directory...\n");
+    let dir = b".\0";
     let fd = unsafe {
         syscall(
             SYS_OPENAT,
             AT_FDCWD as usize,
             dir.as_ptr() as usize,
-            O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC
+            O_RDONLY|O_NONBLOCK|O_CLOEXEC  // Removed O_DIRECTORY
         )
     };
-
-    if fd < 0 {
+    if fd > isize::MAX as usize {
+        print_str(b"Error opening directory. Error code: ");
+        print_isize(-(fd as isize));
+        print_str(b"\n");
         exit(1);
     }
 
-    const BUFFER_SIZE: usize = 32768;
+    print_str(b"File opened successfully. FD: ");
+    print_usize(fd);
+    print_str(b"\n");
+
+    // Check file status
+    let mut statbuf: MaybeUninit<linux_stat> = MaybeUninit::uninit();
+    let fstat_result = unsafe {
+        syscall(SYS_FSTAT, fd, statbuf.as_mut_ptr() as usize, 0)
+    };
+    if fstat_result > isize::MAX as usize {
+        print_str(b"Error checking file status. Error code: ");
+        print_isize(-(fstat_result as isize));
+        print_str(b"\n");
+        unsafe { syscall(SYS_CLOSE, fd, 0, 0); }
+        exit(1);
+    }
+    
+    let st_mode = unsafe { (*statbuf.as_ptr()).st_mode };
+    print_str(b"File mode: ");
+    print_usize(st_mode as usize);
+    print_str(b"\n");
+
+    // Check file status
+    let mut statbuf: MaybeUninit<linux_stat> = MaybeUninit::uninit();
+    let fstat_result = unsafe {
+        syscall(SYS_FSTAT, fd, statbuf.as_mut_ptr() as usize, 0)
+    };
+    if fstat_result > isize::MAX as usize {
+        print_str(b"Error checking file status. Error code: ");
+        print_isize(-(fstat_result as isize));
+        print_str(b"\n");
+        unsafe { syscall(SYS_CLOSE, fd, 0, 0); }
+        exit(1);
+    }
+
+    print_str(b"Reading directory entries...\n");
+
+    const BUFFER_SIZE: usize = 1024;
     let mut buffer: [MaybeUninit<u8>; BUFFER_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
 
     let bytes_read = unsafe {
         syscall(
             SYS_GETDENTS64,
-            fd as usize,
+            fd,
             buffer.as_mut_ptr() as usize,
             BUFFER_SIZE
         )
     };
 
-    if bytes_read < 0 {
-        exit(2);
+    print_str(b"Syscall return value: ");
+    print_usize(bytes_read);
+    print_str(b"\n");
+
+    if bytes_read > isize::MAX as usize {
+        print_str(b"Error reading directory. Error code: ");
+        print_usize(!bytes_read + 1);
+        print_str(b"\n");
+    } else {
+        print_str(b"Directory read successfully. Bytes read: ");
+        print_usize(bytes_read);
+        print_str(b"\n");
     }
 
-    let buffer = unsafe { &*(buffer.as_ptr() as *const [u8; BUFFER_SIZE]) };
-
-    let mut offset = 0;
-    while offset < bytes_read as usize {
-        let dirent = unsafe { &*(buffer.as_ptr().add(offset) as *const linux_dirent64) };
-        
-        let len = dirent.d_reclen as usize;
-        if len == 0 {
-            break;
-        }
-
-        // Print the filename
-        let mut name_len = 0;
-        while name_len < 256 && dirent.d_name[name_len] != 0 {
-            name_len += 1;
-        }
-
-        unsafe {
-            syscall(SYS_WRITE, STDOUT, dirent.d_name.as_ptr() as usize, name_len);
-            syscall(SYS_WRITE, STDOUT, b"\n".as_ptr() as usize, 1);
-        }
-
-        offset += len;
-    }
-
+    // Close the directory
     unsafe {
-        syscall(SYS_CLOSE, fd as usize, 0, 0);
+        syscall(SYS_CLOSE, fd, 0, 0);
     }
 
     exit(0);
@@ -120,4 +172,59 @@ fn exit(code: usize) -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
+}
+
+fn print_isize(mut n: isize) {
+    if n == 0 {
+        print_char(b'0');
+        return;
+    }
+
+    if n < 0 {
+        print_char(b'-');
+        // Handle edge case of minimum isize value
+        if n == isize::MIN {
+            print_str(b"9223372036854775808");
+            return;
+        }
+        n = -n;
+    }
+
+    // Convert to usize now that we've handled the negative case
+    print_usize(n as usize);
+}
+
+fn print_usize(mut n: usize) {
+    if n == 0 {
+        return; // This case is handled in print_isize
+    }
+
+    let digits = b"0123456789";
+    let mut digit_count = 0;
+    let mut temp = n;
+
+    // Count digits
+    while temp > 0 {
+        digit_count += 1;
+        temp /= 10;
+    }
+
+    // Print digits from most significant to least
+    while digit_count > 0 {
+        digit_count -= 1;
+        let digit = (n / 10_usize.pow(digit_count as u32)) % 10;
+        print_char(digits[digit]);
+    }
+}
+
+fn print_char(c: u8) {
+    unsafe {
+        syscall(SYS_WRITE, STDOUT, &c as *const u8 as usize, 1);
+    }
+}
+
+fn print_str(s: &[u8]) {
+    unsafe {
+        syscall(SYS_WRITE, STDOUT, s.as_ptr() as usize, s.len());
+    }
 }
