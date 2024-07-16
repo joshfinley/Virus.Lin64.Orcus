@@ -7,6 +7,7 @@ use core::ptr;
 use core::mem::MaybeUninit;
 
 const SYS_EXIT: usize = 60;
+const SYS_READ: usize = 0;
 const SYS_WRITE: usize = 1;
 const SYS_OPEN: usize = 2;
 const SYS_CLOSE: usize = 3;
@@ -25,6 +26,9 @@ const STDOUT: usize = 1;
 const SYS_FSTAT: usize = 5;
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const MAX_PATH_LEN: usize = 256;
 
 #[repr(C)]
 struct linux_stat {
@@ -137,6 +141,37 @@ pub extern "C" fn _start() -> ! {
         print_str(b"Directory read successfully. Bytes read: ");
         print_usize(bytes_read);
         print_str(b"\n");
+
+        // Process directory entries
+        let buffer = unsafe { &*(buffer.as_ptr() as *const [u8; BUFFER_SIZE]) };
+        let mut offset = 0;
+        while offset < bytes_read {
+            let dirent = unsafe { &*(buffer.as_ptr().add(offset) as *const linux_dirent64) };
+
+            // Check if it's a regular file
+            if dirent.d_type == 8 {
+                let name_len = dirent.d_name.iter().position(|&c| c == 0).unwrap_or(256);
+                let file_fd = unsafe {
+                    syscall3(SYS_OPENAT, fd, dirent.d_name.as_ptr() as usize, O_RDWR)
+                };
+
+                if file_fd <= isize::MAX as usize {
+                    let mut header = [0u8; 4];
+                    let bytes_read = unsafe {
+                        syscall3(SYS_READ, file_fd, header.as_mut_ptr() as usize, 4)
+                    };
+                    if bytes_read == 4 && header == ELF_MAGIC {
+                        print_str(b"ELF file found: ");
+                        print_str(&dirent.d_name[..name_len]);
+                        print_str(b"\n");
+                        // Here you can add your file writing logic
+                    } 
+                    unsafe { syscall1(SYS_CLOSE, file_fd); }
+                }
+            }
+
+            offset += dirent.d_reclen as usize;
+        }
     }
 
     // Close the directory
@@ -227,4 +262,32 @@ fn print_str(s: &[u8]) {
     unsafe {
         syscall(SYS_WRITE, STDOUT, s.as_ptr() as usize, s.len());
     }
+}
+
+unsafe fn syscall1(n: usize, a1: usize) -> usize {
+    let ret: usize;
+    core::arch::asm!(
+        "syscall",
+        in("rax") n,
+        in("rdi") a1,
+        out("rcx") _,
+        out("r11") _,
+        lateout("rax") ret,
+    );
+    ret
+}
+
+unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
+    let ret: usize;
+    core::arch::asm!(
+        "syscall",
+        in("rax") n,
+        in("rdi") a1,
+        in("rsi") a2,
+        in("rdx") a3,
+        out("rcx") _,
+        out("r11") _,
+        lateout("rax") ret,
+    );
+    ret
 }

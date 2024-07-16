@@ -4,3 +4,4 @@ target
 .vscode/
 !src/
 !src/**
+test
